@@ -326,3 +326,23 @@
   .pv-vault-tab{font-size:1.02rem;}
   .pv-vault-divider{font-size:.62rem;}
 }
+
+/* ───── Vault tab alignment: Persona left / Character right ───── */
+.pv-head-copy{
+  flex:1 1 auto;
+  min-width:0;
+}
+
+.pv-vault-tabs{
+  width:100%;
+}
+
+.pv-vault-divider{
+  margin-left:auto;
+}
+
+/* On very narrow phones, avoid forcing an awkward giant gap/wrap. */
+@media(max-width:520px){
+  .pv-vault-divider{margin-left:0;}
+  .pv-vault-tabs{justify-content:flex-start;}
+}
