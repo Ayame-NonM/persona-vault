@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 
 const state = {
     personas: [],
@@ -227,6 +227,28 @@ function normalizePersona(avatar, name, rawDescription, settings) {
     return persona;
 }
 
+async function avatarExists(persona) {
+    const url = avatarUrl(persona.avatar);
+    try {
+        const response = await fetch(url, {
+            method: 'HEAD',
+            credentials: 'same-origin',
+            cache: 'no-store',
+        });
+        if (response.ok) return true;
+        if (response.status !== 405) return false;
+    } catch {
+        // Some ST builds/proxies may not like HEAD; fall back to a normal GET.
+    }
+
+    try {
+        const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        return response.ok;
+    } catch {
+        return false;
+    }
+}
+
 async function loadPersonas() {
     const settings = powerUser();
     const names = settings?.personas && typeof settings.personas === 'object' ? settings.personas : {};
@@ -238,14 +260,21 @@ async function loadPersonas() {
         .map(([avatar, name]) => normalizePersona(avatar, name, descriptions[avatar], settings))
         .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
 
-    await Promise.all(state.personas.map(hydratePersonaLore));
+    await Promise.all(state.personas.map(async persona => {
+        await hydratePersonaLore(persona);
+        persona.avatarMissing = !(await avatarExists(persona));
+    }));
 
     state.filtered = state.personas.slice();
     state.selected.clear();
     renderGrid();
 
     const loreCount = state.personas.filter(persona => persona.hasLore).length;
-    setStatus(`Готово: ${state.personas.length} персон${loreCount ? ` · с lorebook: ${loreCount}` : ''}.`);
+    const brokenCount = state.personas.filter(persona => persona.avatarMissing).length;
+    const parts = [`Готово: ${state.personas.length} персон`];
+    if (loreCount) parts.push(`с lorebook: ${loreCount}`);
+    if (brokenCount) parts.push(`повреждённых: ${brokenCount}`);
+    setStatus(`${parts.join(' · ')}.`);
 }
 
 function downloadBlob(blob, filename) {
@@ -525,24 +554,37 @@ async function exportSelectedZip(type, items) {
 
     const zip = new JSZip();
     const usedNames = new Set();
+    let added = 0;
+    let skipped = 0;
 
     for (let i = 0; i < items.length; i++) {
         const persona = items[i];
         setStatus(`${type.toUpperCase()} ${i + 1}/${items.length}: ${persona.name}`);
 
-        if (type === 'png') {
-            const blob = await buildPersonaPng(persona);
-            zip.file(uniqueZipFileName(persona, usedNames, 'png'), await blob.arrayBuffer());
-        } else {
-            const blob = buildPersonaTxt(persona);
-            zip.file(uniqueZipFileName(persona, usedNames, 'txt'), await blob.arrayBuffer());
+        try {
+            if (type === 'png') {
+                if (persona.avatarMissing) throw new Error('аватар не найден');
+                const blob = await buildPersonaPng(persona);
+                zip.file(uniqueZipFileName(persona, usedNames, 'png'), await blob.arrayBuffer());
+            } else {
+                const blob = buildPersonaTxt(persona);
+                zip.file(uniqueZipFileName(persona, usedNames, 'txt'), await blob.arrayBuffer());
+            }
+            added += 1;
+        } catch (error) {
+            skipped += 1;
+            state.selected.delete(persona.avatar);
+            console.warn(`[${MODULE}] skipped ${persona.name}:`, error);
         }
     }
+
+    if (!added) throw new Error('Не удалось подготовить ни одного файла');
 
     const archive = await zip.generateAsync({ type: 'blob' });
     const stamp = new Date().toISOString().slice(0, 10);
     downloadBlob(archive, `persona-vault-${type}-${stamp}.zip`);
-    setStatus(`Готово: ${items.length} ${type.toUpperCase()} в ZIP.`);
+    updateSelectionUi();
+    setStatus(`Готово: ${added} ${type.toUpperCase()} в ZIP${skipped ? ` · пропущено: ${skipped}` : ''}.`);
 }
 
 async function exportSelection(type) {
@@ -611,6 +653,7 @@ function buildCard(persona) {
     const card = document.createElement('article');
     card.className = 'pv-card';
     card.dataset.avatar = persona.avatar;
+    if (persona.avatarMissing) card.classList.add('is-broken');
 
     const imageWrap = document.createElement('div');
     imageWrap.className = 'pv-image-wrap';
@@ -625,15 +668,23 @@ function buildCard(persona) {
     const check = document.createElement('input');
     check.type = 'checkbox';
     check.className = 'pv-check';
+    check.disabled = Boolean(persona.avatarMissing);
     check.setAttribute('aria-label', `Выбрать ${persona.name}`);
     check.addEventListener('click', event => event.stopPropagation());
     check.addEventListener('change', () => {
+        if (persona.avatarMissing) return;
         check.checked ? state.selected.add(persona.avatar) : state.selected.delete(persona.avatar);
         updateSelectionUi();
     });
     imageWrap.appendChild(check);
 
-    if (persona.hasLore) {
+    if (persona.avatarMissing) {
+        const badge = document.createElement('span');
+        badge.className = 'pv-badge';
+        badge.textContent = 'НЕТ АВЫ';
+        badge.title = 'Сиротская запись персоны: файл аватара больше не существует';
+        imageWrap.appendChild(badge);
+    } else if (persona.hasLore) {
         const badge = document.createElement('span');
         badge.className = 'pv-badge';
         badge.textContent = 'LORE';
@@ -650,9 +701,11 @@ function buildCard(persona) {
 
     const meta = document.createElement('div');
     meta.className = 'pv-meta';
-    meta.textContent = persona.hasLore
-        ? `Lorebook: ${persona.loreName}`
-        : (persona.loreName ? `Lorebook link: ${persona.loreName}` : (persona.title || 'Без привязанного lorebook'));
+    meta.textContent = persona.avatarMissing
+        ? 'Повреждённая запись · аватар не найден'
+        : persona.hasLore
+            ? `Lorebook: ${persona.loreName}`
+            : (persona.loreName ? `Lorebook link: ${persona.loreName}` : (persona.title || 'Без привязанного lorebook'));
 
     const preview = document.createElement('p');
     preview.className = 'pv-description';
@@ -660,8 +713,10 @@ function buildCard(persona) {
 
     const actions = document.createElement('div');
     actions.className = 'pv-card-actions';
+    const pngButton = makeButton('PNG', 'pv-btn pv-btn-primary', () => exportPng(persona), 'Скачать PNG-карточку');
+    pngButton.disabled = Boolean(persona.avatarMissing);
     actions.append(
-        makeButton('PNG', 'pv-btn pv-btn-primary', () => exportPng(persona), 'Скачать PNG-карточку'),
+        pngButton,
         makeButton('TXT', 'pv-btn', () => exportTxt(persona), 'Скачать TXT-описание'),
     );
 
@@ -669,6 +724,7 @@ function buildCard(persona) {
     card.append(imageWrap, body);
 
     card.addEventListener('click', () => {
+        if (persona.avatarMissing) return;
         state.selected.has(persona.avatar) ? state.selected.delete(persona.avatar) : state.selected.add(persona.avatar);
         updateSelectionUi();
     });
@@ -755,7 +811,9 @@ function mountModal() {
     modal.querySelector('#pv-download-selected-png').addEventListener('click', () => exportSelection('png'));
     modal.querySelector('#pv-download-selected-txt').addEventListener('click', () => exportSelection('txt'));
     modal.querySelector('#pv-select-all').addEventListener('click', () => {
-        state.filtered.forEach(persona => state.selected.add(persona.avatar));
+        state.filtered
+            .filter(persona => !persona.avatarMissing)
+            .forEach(persona => state.selected.add(persona.avatar));
         updateSelectionUi();
     });
     modal.querySelector('#pv-clear').addEventListener('click', () => {
