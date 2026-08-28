@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 
 const state = {
     personas: [],
@@ -17,6 +17,23 @@ function powerUser() {
     return ctx().powerUserSettings || {};
 }
 
+function requestHeaders() {
+    if (typeof window.getRequestHeaders === 'function') return window.getRequestHeaders();
+    const c = ctx();
+    if (typeof c.getRequestHeaders === 'function') return c.getRequestHeaders();
+    return { 'Content-Type': 'application/json' };
+}
+
+async function postJson(url, body = {}) {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: requestHeaders(),
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    return response.json();
+}
+
 function lower(value) {
     return String(value ?? '').trim().toLocaleLowerCase('ru');
 }
@@ -26,29 +43,6 @@ function firstNonNull(...values) {
         if (value !== undefined && value !== null && value !== '') return value;
     }
     return null;
-}
-
-function uniqueObjects(items) {
-    const seen = new Set();
-    return items.filter(item => {
-        if (!item || typeof item !== 'object') return false;
-        if (seen.has(item)) return false;
-        seen.add(item);
-        return true;
-    });
-}
-
-function avatarUrl(filename) {
-    return `/User Avatars/${encodeURIComponent(filename).replaceAll('%2F', '/')}`;
-}
-
-function safeFileName(value) {
-    const cleaned = String(value || 'persona')
-        .replace(/[\\/:*?"<>|\x00-\x1F]/g, '_')
-        .replace(/^\.+/, '')
-        .replace(/[. ]+$/, '')
-        .trim();
-    return (cleaned || 'persona').slice(0, 110);
 }
 
 function splitKeys(value) {
@@ -100,165 +94,101 @@ function resolvePersonaLoreBinding(avatar, rawMeta, settings) {
 }
 
 function looksLikeLorebook(value) {
-    return Boolean(
-        value && typeof value === 'object' &&
-        (Array.isArray(value.entries) || (value.entries && typeof value.entries === 'object'))
-    );
+    return Boolean(value && typeof value === 'object' && value.entries && typeof value.entries === 'object');
 }
 
-function lorebookNameOf(value) {
-    return firstNonNull(value?.name, value?.title, value?.world_name, value?.worldName, value?.filename, value?.file);
-}
+function convertWorldInfoToCharacterBook(name, world) {
+    if (!looksLikeLorebook(world)) return null;
 
-function lorebookIdOf(value) {
-    return firstNonNull(value?.id, value?.uid, value?.world_id, value?.worldInfoUid, value?.world_info_uid);
-}
-
-function gatherLoreStores(settings) {
-    const c = ctx();
-    return uniqueObjects([
-        c.worldInfo,
-        c.world_info,
-        c.worldInfoCache,
-        c.world_info_cache,
-        c.worldNames,
-        c.world_names,
-        c.lorebooks,
-        c.worlds,
-        c.data?.worldInfo,
-        c.data?.world_info,
-        settings.worldInfo,
-        settings.world_info,
-        settings.worldInfoCache,
-        settings.world_info_cache,
-        settings.worlds,
-        settings.world_names,
-        settings.worldNames,
-        window.worldInfo,
-        window.world_info,
-        window.worldInfoCache,
-        window.world_names,
-    ]);
-}
-
-function directLorebookLookup(store, binding) {
-    if (!store || !binding) return null;
-
-    const wantedName = lower(binding.name);
-    const wantedId = String(binding.id ?? '').trim();
-
-    const probe = candidate => {
-        if (!candidate || typeof candidate !== 'object') return null;
-        if (!looksLikeLorebook(candidate)) return null;
-
-        const candidateName = lower(lorebookNameOf(candidate));
-        const candidateId = String(lorebookIdOf(candidate) ?? '').trim();
-
-        if (wantedName && candidateName && candidateName === wantedName) return candidate;
-        if (wantedId && candidateId && candidateId === wantedId) return candidate;
-        return null;
-    };
-
-    if (Array.isArray(store)) {
-        for (const item of store) {
-            const found = probe(item);
-            if (found) return found;
-        }
-        return null;
+    if (world.originalData && typeof world.originalData === 'object') {
+        return world.originalData;
     }
 
-    if (typeof store === 'object') {
-        if (wantedName && store[wantedName]) {
-            const found = probe(store[wantedName]);
-            if (found) return found;
-        }
-        if (binding.name && store[binding.name]) {
-            const found = probe(store[binding.name]);
-            if (found) return found;
-        }
-        if (wantedId && store[wantedId]) {
-            const found = probe(store[wantedId]);
-            if (found) return found;
-        }
+    const result = { entries: [], name: String(name || 'Persona Lore') };
 
-        if (looksLikeLorebook(store)) {
-            const found = probe(store);
-            if (found) return found;
-        }
+    for (const [index, entry] of Object.entries(world.entries)) {
+        if (!entry || typeof entry !== 'object') continue;
+        const content = String(entry.content ?? '');
+        if (!content.trim()) continue;
 
-        for (const value of Object.values(store)) {
-            const found = probe(value);
-            if (found) return found;
-        }
+        result.entries.push({
+            id: entry.uid ?? Number(index),
+            keys: splitKeys(entry.key),
+            secondary_keys: splitKeys(entry.keysecondary),
+            comment: entry.comment ?? '',
+            content,
+            constant: Boolean(entry.constant),
+            selective: Boolean(entry.selective),
+            insertion_order: Number(entry.order ?? 0),
+            enabled: !Boolean(entry.disable),
+            position: Number(entry.position) === 0 ? 'before_char' : 'after_char',
+            use_regex: true,
+            extensions: {
+                ...(entry.extensions && typeof entry.extensions === 'object' ? entry.extensions : {}),
+                position: entry.position,
+                exclude_recursion: entry.excludeRecursion,
+                display_index: entry.displayIndex,
+                probability: entry.probability ?? null,
+                useProbability: entry.useProbability ?? false,
+                depth: entry.depth ?? 4,
+                selectiveLogic: entry.selectiveLogic ?? 0,
+                outlet_name: entry.outletName ?? '',
+                group: entry.group ?? '',
+                group_override: entry.groupOverride ?? false,
+                group_weight: entry.groupWeight ?? null,
+                prevent_recursion: entry.preventRecursion ?? false,
+                delay_until_recursion: entry.delayUntilRecursion ?? false,
+                scan_depth: entry.scanDepth ?? null,
+                match_whole_words: entry.matchWholeWords ?? null,
+                use_group_scoring: entry.useGroupScoring ?? false,
+                case_sensitive: entry.caseSensitive ?? null,
+                automation_id: entry.automationId ?? '',
+                role: entry.role ?? 0,
+                vectorized: entry.vectorized ?? false,
+                sticky: entry.sticky ?? null,
+                cooldown: entry.cooldown ?? null,
+                delay: entry.delay ?? null,
+                match_persona_description: entry.matchPersonaDescription ?? false,
+                match_character_description: entry.matchCharacterDescription ?? false,
+                match_character_personality: entry.matchCharacterPersonality ?? false,
+                match_character_depth_prompt: entry.matchCharacterDepthPrompt ?? false,
+                match_scenario: entry.matchScenario ?? false,
+                match_creator_notes: entry.matchCreatorNotes ?? false,
+                triggers: entry.triggers ?? [],
+                ignore_budget: entry.ignoreBudget ?? false,
+            },
+        });
     }
 
-    return null;
+    return result.entries.length ? result : null;
 }
 
-function normalizeCharacterBook(source, fallbackName = '') {
-    if (!looksLikeLorebook(source)) return null;
+const loreCache = new Map();
 
-    const rawEntries = Array.isArray(source.entries)
-        ? source.entries
-        : Object.values(source.entries || {});
-
-    const entries = rawEntries
-        .map((entry, index) => {
-            if (!entry || typeof entry !== 'object') return null;
-
-            const content = String(firstNonNull(entry.content, entry.text, entry.entry, entry.value, entry.memo, '')).trim();
-            const keys = splitKeys(firstNonNull(entry.keys, entry.key, entry.primary_keys));
-            const secondary = splitKeys(firstNonNull(entry.secondary_keys, entry.keysecondary, entry.secondary));
-            const enabled = entry.enabled ?? !entry.disable;
-
-            if (!content) return null;
-
-            return {
-                keys,
-                content,
-                extensions: typeof entry.extensions === 'object' && entry.extensions ? entry.extensions : {},
-                enabled: Boolean(enabled),
-                insertion_order: Number(firstNonNull(entry.insertion_order, entry.order, entry.display_index, index)) || 0,
-                case_sensitive: Boolean(firstNonNull(entry.case_sensitive, entry.caseSensitive, false)),
-                id: firstNonNull(entry.id, entry.uid, index),
-                name: firstNonNull(entry.name, entry.comment, entry.title) || undefined,
-                comment: firstNonNull(entry.comment, entry.memo) || undefined,
-                selective: Boolean(firstNonNull(entry.selective, entry.selectiveLogic, false)),
-                secondary_keys: secondary.length ? secondary : undefined,
-                constant: Boolean(firstNonNull(entry.constant, entry.always_active, false)),
-                position: firstNonNull(entry.position, entry.insertion_position, entry.place) || undefined,
-                priority: firstNonNull(entry.priority, entry.weight) ?? undefined,
-            };
-        })
-        .filter(Boolean);
-
-    if (!entries.length) return null;
-
-    return {
-        name: String(firstNonNull(lorebookNameOf(source), fallbackName, 'Persona Lore')).trim() || 'Persona Lore',
-        description: String(firstNonNull(source.description, source.comment, '')).trim(),
-        scan_depth: Number(firstNonNull(source.scan_depth, source.scanDepth, source.depth, 4)) || 4,
-        token_budget: Number(firstNonNull(source.token_budget, source.tokenBudget, source.context_limit, 512)) || 512,
-        recursive_scanning: Boolean(firstNonNull(source.recursive_scanning, source.recursiveScanning, true)),
-        extensions: typeof source.extensions === 'object' && source.extensions ? source.extensions : {},
-        entries,
-    };
-}
-
-function resolveCharacterBook(persona, settings) {
-    const binding = persona.loreBinding;
+async function fetchCharacterBook(binding) {
     if (!binding) return null;
+    if (binding.data) return convertWorldInfoToCharacterBook(binding.name, binding.data);
+    if (!binding.name) return null;
 
-    if (binding.data) {
-        return normalizeCharacterBook(binding.data, binding.name);
+    const key = String(binding.name);
+    if (!loreCache.has(key)) {
+        loreCache.set(key, postJson('/api/worldinfo/get', { name: key })
+            .then(world => convertWorldInfoToCharacterBook(key, world))
+            .catch(error => {
+                console.warn(`[${MODULE}] failed to load lorebook "${key}"`, error);
+                return null;
+            }));
     }
 
-    for (const store of gatherLoreStores(settings)) {
-        const found = directLorebookLookup(store, binding);
-        if (found) return normalizeCharacterBook(found, binding.name);
-    }
+    return loreCache.get(key);
+}
 
-    return null;
+async function hydratePersonaLore(persona) {
+    if (!persona?.loreBinding) return persona;
+    persona.characterBook = await fetchCharacterBook(persona.loreBinding);
+    persona.hasLore = Boolean(persona.characterBook);
+    persona.loreName = persona.characterBook?.name || persona.loreBinding?.name || '';
+    return persona;
 }
 
 function normalizePersona(avatar, name, rawDescription, settings) {
@@ -278,9 +208,9 @@ function normalizePersona(avatar, name, rawDescription, settings) {
         loreBinding: resolvePersonaLoreBinding(avatar, meta, settings),
     };
 
-    persona.characterBook = resolveCharacterBook(persona, settings);
-    persona.hasLore = Boolean(persona.characterBook);
-    persona.loreName = persona.characterBook?.name || persona.loreBinding?.name || '';
+    persona.characterBook = null;
+    persona.hasLore = false;
+    persona.loreName = persona.loreBinding?.name || '';
     return persona;
 }
 
@@ -294,6 +224,8 @@ async function loadPersonas() {
     state.personas = Object.entries(names)
         .map(([avatar, name]) => normalizePersona(avatar, name, descriptions[avatar], settings))
         .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+
+    await Promise.all(state.personas.map(hydratePersonaLore));
 
     state.filtered = state.personas.slice();
     state.selected.clear();
@@ -504,6 +436,7 @@ function embedCharacterCard(pngBytes, payload) {
 }
 
 async function buildPersonaPng(persona) {
+    if (persona.loreBinding && !persona.characterBook) await hydratePersonaLore(persona);
     const avatarBlob = await fetchAvatarBlob(persona);
     const pngBytes = await toPngBytes(avatarBlob);
     const output = embedCharacterCard(pngBytes, cardPayload(persona));
@@ -687,7 +620,7 @@ function buildCard(persona) {
     });
     imageWrap.appendChild(check);
 
-    if (persona.hasLore || persona.loreName) {
+    if (persona.hasLore) {
         const badge = document.createElement('span');
         badge.className = 'pv-badge';
         badge.textContent = 'LORE';
@@ -704,9 +637,9 @@ function buildCard(persona) {
 
     const meta = document.createElement('div');
     meta.className = 'pv-meta';
-    meta.textContent = persona.loreName
+    meta.textContent = persona.hasLore
         ? `Lorebook: ${persona.loreName}`
-        : (persona.title || 'Без привязанного lorebook');
+        : (persona.loreName ? `Lorebook link: ${persona.loreName}` : (persona.title || 'Без привязанного lorebook'));
 
     const preview = document.createElement('p');
     preview.className = 'pv-description';
