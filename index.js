@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 const state = {
     personas: [],
@@ -552,32 +552,41 @@ function uniqueZipFileName(persona, usedNames, ext) {
     return candidate;
 }
 
-async function exportSelected(type) {
+async function exportSelectedZip(type, items) {
+    if (!(await ensureZip())) throw new Error('JSZip не найден в SillyTavern');
+
+    const zip = new JSZip();
+    const usedNames = new Set();
+
+    for (let i = 0; i < items.length; i++) {
+        const persona = items[i];
+        setStatus(`${type.toUpperCase()} ${i + 1}/${items.length}: ${persona.name}`);
+
+        if (type === 'png') {
+            const blob = await buildPersonaPng(persona);
+            zip.file(uniqueZipFileName(persona, usedNames, 'png'), await blob.arrayBuffer());
+        } else {
+            const blob = buildPersonaTxt(persona);
+            zip.file(uniqueZipFileName(persona, usedNames, 'txt'), await blob.arrayBuffer());
+        }
+    }
+
+    const archive = await zip.generateAsync({ type: 'blob' });
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBlob(archive, `persona-vault-${type}-${stamp}.zip`);
+    setStatus(`Готово: ${items.length} ${type.toUpperCase()} в ZIP.`);
+}
+
+async function exportSelection(type) {
     const items = state.personas.filter(persona => state.selected.has(persona.avatar));
     if (!items.length) return setStatus('Сначала выбери хотя бы одну персону.');
 
+    if (items.length === 1) {
+        return type === 'png' ? exportPng(items[0]) : exportTxt(items[0]);
+    }
+
     try {
-        if (!(await ensureZip())) throw new Error('JSZip не найден в SillyTavern');
-        const zip = new JSZip();
-        const usedNames = new Set();
-
-        for (let i = 0; i < items.length; i++) {
-            const persona = items[i];
-            setStatus(`${type.toUpperCase()} ${i + 1}/${items.length}: ${persona.name}`);
-
-            if (type === 'png') {
-                const blob = await buildPersonaPng(persona);
-                zip.file(uniqueZipFileName(persona, usedNames, 'png'), await blob.arrayBuffer());
-            } else {
-                const blob = buildPersonaTxt(persona);
-                zip.file(uniqueZipFileName(persona, usedNames, 'txt'), await blob.arrayBuffer());
-            }
-        }
-
-        const archive = await zip.generateAsync({ type: 'blob' });
-        const stamp = new Date().toISOString().slice(0, 10);
-        downloadBlob(archive, `persona-vault-${type}-${stamp}.zip`);
-        setStatus(`Готово: ${items.length} ${type.toUpperCase()} в ZIP.`);
+        await exportSelectedZip(type, items);
     } catch (error) {
         showError(error);
     }
@@ -597,12 +606,23 @@ function setStatus(text, isError = false) {
 }
 
 function updateSelectionUi() {
-    document.querySelector('#pv-selected-count')?.replaceChildren(document.createTextNode(String(state.selected.size)));
+    const count = state.selected.size;
+    document.querySelector('#pv-selected-count')?.replaceChildren(document.createTextNode(String(count)));
+
+    const png = document.querySelector('#pv-download-selected-png');
+    const txt = document.querySelector('#pv-download-selected-txt');
+    if (png && txt) {
+        png.disabled = count === 0;
+        txt.disabled = count === 0;
+        png.textContent = count > 1 ? `PNG ZIP · ${count}` : count === 1 ? 'PNG · 1' : 'PNG';
+        txt.textContent = count > 1 ? `TXT ZIP · ${count}` : count === 1 ? 'TXT · 1' : 'TXT';
+    }
+
     document.querySelectorAll('.pv-card').forEach(card => {
-        const selected = state.selected.has(card.dataset.avatar);
-        card.classList.toggle('is-selected', selected);
+        const isSelected = state.selected.has(card.dataset.avatar);
+        card.classList.toggle('is-selected', isSelected);
         const input = card.querySelector('.pv-check');
-        if (input) input.checked = selected;
+        if (input) input.checked = isSelected;
     });
 }
 
@@ -748,8 +768,9 @@ function mountModal() {
                 <input id="pv-search" class="pv-search" type="search" placeholder="Поиск по персонам…" autocomplete="off">
                 <button type="button" id="pv-select-all" class="pv-btn">Выбрать все</button>
                 <button type="button" id="pv-clear" class="pv-btn">Снять</button>
-                <button type="button" id="pv-download-selected-png" class="pv-btn pv-btn-primary">PNG ZIP · <span id="pv-selected-count">0</span></button>
-                <button type="button" id="pv-download-selected-txt" class="pv-btn">TXT ZIP</button>
+                <button type="button" id="pv-download-selected-png" class="pv-btn pv-btn-primary" disabled>PNG</button>
+                <button type="button" id="pv-download-selected-txt" class="pv-btn" disabled>TXT</button>
+                <span id="pv-selected-count" class="pv-count" hidden>0</span>
                 <button type="button" id="pv-refresh" class="pv-btn pv-icon-btn" title="Обновить">↻</button>
             </div>
 
@@ -763,8 +784,8 @@ function mountModal() {
     modal.querySelectorAll('[data-pv-close]').forEach(node => node.addEventListener('click', closeVault));
     modal.querySelector('#pv-search').addEventListener('input', event => filterBy(event.target.value));
     modal.querySelector('#pv-refresh').addEventListener('click', () => loadPersonas().catch(showError));
-    modal.querySelector('#pv-download-selected-png').addEventListener('click', () => exportSelected('png'));
-    modal.querySelector('#pv-download-selected-txt').addEventListener('click', () => exportSelected('txt'));
+    modal.querySelector('#pv-download-selected-png').addEventListener('click', () => exportSelection('png'));
+    modal.querySelector('#pv-download-selected-txt').addEventListener('click', () => exportSelection('txt'));
     modal.querySelector('#pv-select-all').addEventListener('click', () => {
         state.filtered.forEach(persona => state.selected.add(persona.avatar));
         updateSelectionUi();
