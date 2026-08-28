@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 
 let personas = [];
 let filtered = [];
@@ -127,6 +127,7 @@ function cardPayload(persona) {
                 persona_vault: {
                     backup: true,
                     source_avatar: persona.avatar,
+                    exporter_version: VERSION,
                     title: persona.title,
                     position: persona.position,
                     depth: persona.depth,
@@ -298,11 +299,13 @@ async function ensureZip() {
 
 function uniqueZipFileName(persona, usedNames) {
     const base = safeFileName(persona.name);
-    let candidate = `${base}.persona.png`;
+    const avatarStem = safeFileName(String(persona.avatar || 'avatar').replace(/\.[^.]+$/, ''));
+    const uniqueId = avatarStem.slice(-18) || 'avatar';
+    let candidate = `${base} [${uniqueId}].persona.png`;
     let index = 2;
 
     while (usedNames.has(candidate.toLocaleLowerCase())) {
-        candidate = `${base} (${index}).persona.png`;
+        candidate = `${base} [${uniqueId}-${index}].persona.png`;
         index += 1;
     }
 
@@ -323,10 +326,16 @@ async function exportSelectedZip() {
             const persona = items[i];
             setStatus(`PNG ${i + 1}/${items.length}: ${persona.name}`);
             const blob = await buildPersonaPng(persona);
-            zip.file(uniqueZipFileName(persona, usedNames), blob);
+            const filename = uniqueZipFileName(persona, usedNames);
+            zip.file(filename, await blob.arrayBuffer());
         }
 
-        setStatus('Упаковываю ZIP…');
+        const entryCount = Object.values(zip.files).filter(entry => !entry.dir).length;
+        if (entryCount !== items.length) {
+            throw new Error(`ZIP содержит ${entryCount} из ${items.length} подготовленных файлов`);
+        }
+
+        setStatus(`Упаковываю ZIP · ${entryCount}/${items.length}…`);
         const archive = await zip.generateAsync({ type: 'blob' });
         const stamp = new Date().toISOString().slice(0, 10);
         downloadBlob(archive, `persona-vault-${stamp}.zip`);
@@ -475,7 +484,7 @@ function mountModal() {
             <header class="pv-window-head">
                 <div>
                     <div class="pv-kicker">✦ ARCANE ARCHIVE ✦</div>
-                    <h2>Persona Vault</h2>
+                    <h2>Persona Vault <small style="opacity:.55;font-size:.45em">v${VERSION}</small></h2>
                     <p>Персоны → переносимые PNG-карточки или чистый TXT.</p>
                 </div>
                 <button type="button" class="pv-close" data-pv-close aria-label="Закрыть">×</button>
@@ -525,7 +534,7 @@ function mountSettingsEntry() {
     root.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>✦ Persona Vault ✦</b>
+                <b>✦ Persona Vault ✦ <small style="opacity:.55">v${VERSION}</small></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
