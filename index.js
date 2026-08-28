@@ -1,12 +1,15 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.2.5';
+const VERSION = '0.3.0';
 
 const state = {
+    mode: 'persona',
     personas: [],
+    characters: [],
     filtered: [],
     selected: new Set(),
     mounted: false,
     zipPromise: null,
+    loadSeq: 0,
 };
 
 function ctx() {
@@ -32,6 +35,16 @@ async function postJson(url, body = {}) {
     });
     if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
     return response.json();
+}
+
+async function postBlob(url, body = {}) {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: requestHeaders(),
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    return response.blob();
 }
 
 function lower(value) {
@@ -249,32 +262,88 @@ async function avatarExists(persona) {
     }
 }
 
-async function loadPersonas() {
+async function loadPersonas(loadSeq) {
     const settings = powerUser();
     const names = settings?.personas && typeof settings.personas === 'object' ? settings.personas : {};
     const descriptions = settings?.persona_descriptions && typeof settings.persona_descriptions === 'object'
         ? settings.persona_descriptions
         : {};
 
-    state.personas = Object.entries(names)
+    const personas = Object.entries(names)
         .map(([avatar, name]) => normalizePersona(avatar, name, descriptions[avatar], settings))
         .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
 
-    await Promise.all(state.personas.map(async persona => {
+    await Promise.all(personas.map(async persona => {
         await hydratePersonaLore(persona);
         persona.avatarMissing = !(await avatarExists(persona));
     }));
 
-    state.filtered = state.personas.slice();
+    if (loadSeq !== state.loadSeq || state.mode !== 'persona') return;
+
+    state.personas = personas;
+    state.filtered = personas.slice();
     state.selected.clear();
     renderGrid();
 
-    const loreCount = state.personas.filter(persona => persona.hasLore).length;
-    const brokenCount = state.personas.filter(persona => persona.avatarMissing).length;
-    const parts = [`Готово: ${state.personas.length} персон`];
+    const loreCount = personas.filter(persona => persona.hasLore).length;
+    const brokenCount = personas.filter(persona => persona.avatarMissing).length;
+    const parts = [`Готово: ${personas.length} персон`];
     if (loreCount) parts.push(`с lorebook: ${loreCount}`);
     if (brokenCount) parts.push(`повреждённых: ${brokenCount}`);
     setStatus(`${parts.join(' · ')}.`);
+}
+
+function characterAvatarUrl(character) {
+    const avatar = String(character?.avatar || '').trim();
+    const raw = character?.avatar_url;
+    if (raw && /^(?:https?:|data:|blob:|\/)/i.test(String(raw))) return String(raw);
+
+    const thumbnail = ctx().getThumbnailUrl || window.getThumbnailUrl;
+    if (avatar && typeof thumbnail === 'function') {
+        try { return thumbnail('avatar', avatar); } catch { /* fall through */ }
+    }
+
+    return avatar ? `/characters/${encodeURIComponent(avatar).replaceAll('%2F', '/')}` : '';
+}
+
+function normalizeCharacter(character, index) {
+    const data = character?.data && typeof character.data === 'object' ? character.data : {};
+    return {
+        key: String(character?.avatar || `character-${index}`),
+        avatar: String(character?.avatar || ''),
+        image: characterAvatarUrl(character),
+        name: String(character?.name || data.name || 'Без имени'),
+        description: String(character?.description || data.description || ''),
+        creator: String(data.creator || character?.creator || ''),
+        version: String(data.character_version || character?.character_version || ''),
+        tags: Array.isArray(character?.tags) ? character.tags : (Array.isArray(data.tags) ? data.tags : []),
+        raw: character,
+    };
+}
+
+async function loadCharacters(loadSeq) {
+    const source = Array.isArray(ctx().characters) ? ctx().characters : [];
+    const characters = source
+        .filter(character => character && character.avatar)
+        .map(normalizeCharacter)
+        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+
+    if (loadSeq !== state.loadSeq || state.mode !== 'character') return;
+
+    state.characters = characters;
+    state.filtered = characters.slice();
+    state.selected.clear();
+    renderGrid();
+    setStatus(`Готово: ${characters.length} чаров.`);
+}
+
+async function loadCurrentMode() {
+    const loadSeq = ++state.loadSeq;
+    return state.mode === 'character' ? loadCharacters(loadSeq) : loadPersonas(loadSeq);
+}
+
+function currentItems() {
+    return state.mode === 'character' ? state.characters : state.personas;
 }
 
 function downloadBlob(blob, filename) {
@@ -518,6 +587,25 @@ function exportTxt(persona) {
     }
 }
 
+async function buildCharacterExport(character, format) {
+    return postBlob('/api/characters/export', {
+        avatar_url: character.avatar,
+        format,
+    });
+}
+
+async function exportCharacterFile(character, format) {
+    try {
+        const label = format.toUpperCase();
+        setStatus(`Собираю ${label}: ${character.name}…`);
+        const blob = await buildCharacterExport(character, format);
+        downloadBlob(blob, `${safeFileName(character.name)}.character.${format}`);
+        setStatus(`${label} готов: ${character.name}.`);
+    } catch (error) {
+        showError(error);
+    }
+}
+
 async function ensureZip() {
     if (window.JSZip) return true;
     if (state.zipPromise) return state.zipPromise;
@@ -549,7 +637,7 @@ function uniqueZipFileName(persona, usedNames, ext) {
     return candidate;
 }
 
-async function exportSelectedZip(type, items) {
+async function exportPersonaSelectedZip(type, items) {
     if (!(await ensureZip())) throw new Error('JSZip не найден в SillyTavern');
 
     const zip = new JSZip();
@@ -587,7 +675,61 @@ async function exportSelectedZip(type, items) {
     setStatus(`Готово: ${added} ${type.toUpperCase()} в ZIP${skipped ? ` · пропущено: ${skipped}` : ''}.`);
 }
 
+async function exportCharacterSelectedZip(format, items) {
+    if (!(await ensureZip())) throw new Error('JSZip не найден в SillyTavern');
+
+    const zip = new JSZip();
+    const usedNames = new Set();
+    let added = 0;
+    let skipped = 0;
+
+    for (let i = 0; i < items.length; i++) {
+        const character = items[i];
+        const label = format.toUpperCase();
+        setStatus(`${label} ${i + 1}/${items.length}: ${character.name}`);
+
+        try {
+            const blob = await buildCharacterExport(character, format);
+            const base = safeFileName(character.name);
+            let filename = `${base}.character.${format}`;
+            let n = 2;
+            while (usedNames.has(filename.toLocaleLowerCase())) {
+                filename = `${base} (${n++}).character.${format}`;
+            }
+            usedNames.add(filename.toLocaleLowerCase());
+            zip.file(filename, await blob.arrayBuffer());
+            added += 1;
+        } catch (error) {
+            skipped += 1;
+            state.selected.delete(character.key);
+            console.warn(`[${MODULE}] skipped character ${character.name}:`, error);
+        }
+    }
+
+    if (!added) throw new Error('Не удалось подготовить ни одного файла');
+
+    const archive = await zip.generateAsync({ type: 'blob' });
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBlob(archive, `character-vault-${format}-${stamp}.zip`);
+    updateSelectionUi();
+    setStatus(`Готово: ${added} ${format.toUpperCase()} в ZIP${skipped ? ` · пропущено: ${skipped}` : ''}.`);
+}
+
 async function exportSelection(type) {
+    if (state.mode === 'character') {
+        const items = state.characters.filter(character => state.selected.has(character.key));
+        if (!items.length) return setStatus('Сначала выбери хотя бы одного чара.');
+
+        if (items.length === 1) return exportCharacterFile(items[0], type);
+
+        try {
+            await exportCharacterSelectedZip(type, items);
+        } catch (error) {
+            showError(error);
+        }
+        return;
+    }
+
     const items = state.personas.filter(persona => state.selected.has(persona.avatar));
     if (!items.length) return setStatus('Сначала выбери хотя бы одну персону.');
 
@@ -596,7 +738,7 @@ async function exportSelection(type) {
     }
 
     try {
-        await exportSelectedZip(type, items);
+        await exportPersonaSelectedZip(type, items);
     } catch (error) {
         showError(error);
     }
@@ -619,17 +761,19 @@ function updateSelectionUi() {
     const count = state.selected.size;
     document.querySelector('#pv-selected-count')?.replaceChildren(document.createTextNode(String(count)));
 
-    const png = document.querySelector('#pv-download-selected-png');
-    const txt = document.querySelector('#pv-download-selected-txt');
-    if (png && txt) {
-        png.disabled = count === 0;
-        txt.disabled = count === 0;
-        png.textContent = count > 1 ? `PNG ZIP · ${count}` : count === 1 ? 'PNG · 1' : 'PNG';
-        txt.textContent = count > 1 ? `TXT ZIP · ${count}` : count === 1 ? 'TXT · 1' : 'TXT';
+    const primary = document.querySelector('#pv-download-primary');
+    const secondary = document.querySelector('#pv-download-secondary');
+    const secondType = state.mode === 'character' ? 'JSON' : 'TXT';
+
+    if (primary && secondary) {
+        primary.disabled = count === 0;
+        secondary.disabled = count === 0;
+        primary.textContent = count > 1 ? `PNG ZIP · ${count}` : count === 1 ? 'PNG · 1' : 'PNG';
+        secondary.textContent = count > 1 ? `${secondType} ZIP · ${count}` : count === 1 ? `${secondType} · 1` : secondType;
     }
 
     document.querySelectorAll('.pv-card').forEach(card => {
-        const isSelected = state.selected.has(card.dataset.avatar);
+        const isSelected = state.selected.has(card.dataset.key);
         card.classList.toggle('is-selected', isSelected);
         const input = card.querySelector('.pv-check');
         if (input) input.checked = isSelected;
@@ -649,10 +793,10 @@ function makeButton(label, className, onClick, title = '') {
     return button;
 }
 
-function buildCard(persona) {
+function buildPersonaCard(persona) {
     const card = document.createElement('article');
     card.className = 'pv-card';
-    card.dataset.avatar = persona.avatar;
+    card.dataset.key = persona.avatar;
     if (persona.avatarMissing) card.classList.add('is-broken');
 
     const imageWrap = document.createElement('div');
@@ -732,6 +876,128 @@ function buildCard(persona) {
     return card;
 }
 
+
+function buildCharacterCard(character) {
+    const card = document.createElement('article');
+    card.className = 'pv-card';
+    card.dataset.key = character.key;
+
+    const imageWrap = document.createElement('div');
+    imageWrap.className = 'pv-image-wrap';
+
+    const image = document.createElement('img');
+    image.className = 'pv-image';
+    image.src = character.image;
+    image.alt = character.name;
+    image.loading = 'lazy';
+    imageWrap.appendChild(image);
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.className = 'pv-check';
+    check.setAttribute('aria-label', `Выбрать ${character.name}`);
+    check.addEventListener('click', event => event.stopPropagation());
+    check.addEventListener('change', () => {
+        check.checked ? state.selected.add(character.key) : state.selected.delete(character.key);
+        updateSelectionUi();
+    });
+    imageWrap.appendChild(check);
+
+    const badge = document.createElement('span');
+    badge.className = 'pv-badge pv-badge-char';
+    badge.textContent = 'CHAR';
+    badge.title = 'Нативная Character Card SillyTavern';
+    imageWrap.appendChild(badge);
+
+    const body = document.createElement('div');
+    body.className = 'pv-card-body';
+
+    const name = document.createElement('h3');
+    name.className = 'pv-name';
+    name.textContent = character.name;
+
+    const meta = document.createElement('div');
+    meta.className = 'pv-meta';
+    const bits = [];
+    if (character.creator) bits.push(character.creator);
+    if (character.version) bits.push(`v${character.version}`);
+    meta.textContent = bits.length ? bits.join(' · ') : 'Character Card · нативный экспорт ST';
+
+    const preview = document.createElement('p');
+    preview.className = 'pv-description';
+    preview.textContent = character.description || 'Описание пустое';
+
+    const actions = document.createElement('div');
+    actions.className = 'pv-card-actions';
+    actions.append(
+        makeButton('PNG', 'pv-btn pv-btn-primary', () => exportCharacterFile(character, 'png'), 'Скачать PNG-карточку'),
+        makeButton('JSON', 'pv-btn', () => exportCharacterFile(character, 'json'), 'Скачать JSON-карточку'),
+    );
+
+    body.append(name, meta, preview, actions);
+    card.append(imageWrap, body);
+
+    card.addEventListener('click', () => {
+        state.selected.has(character.key) ? state.selected.delete(character.key) : state.selected.add(character.key);
+        updateSelectionUi();
+    });
+
+    return card;
+}
+
+function modeConfig() {
+    return state.mode === 'character'
+        ? {
+            title: 'Character Vault',
+            subtitle: 'PNG/JSON-карточки и массовый ZIP для ваших чаров.',
+            search: 'Поиск по чарам…',
+            secondType: 'json',
+            empty: 'Чары не найдены.',
+        }
+        : {
+            title: 'Persona Vault',
+            subtitle: 'PNG-карточки, TXT и массовый ZIP для ваших персон.',
+            search: 'Поиск по персонам…',
+            secondType: 'txt',
+            empty: 'Персоны не найдены.',
+        };
+}
+
+function syncModeUi() {
+    const config = modeConfig();
+    const title = document.querySelector('#pv-active-title');
+    const subtitle = document.querySelector('#pv-active-subtitle');
+    const search = document.querySelector('#pv-search');
+
+    if (title) title.textContent = config.title;
+    if (subtitle) subtitle.textContent = config.subtitle;
+    if (search) {
+        search.value = '';
+        search.placeholder = config.search;
+    }
+
+    document.querySelectorAll('[data-pv-mode]').forEach(button => {
+        const active = button.dataset.pvMode === state.mode;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', String(active));
+    });
+
+    updateSelectionUi();
+}
+
+async function setMode(mode) {
+    if (!['persona', 'character'].includes(mode)) return;
+    state.mode = mode;
+    state.selected.clear();
+    state.filtered = [];
+    syncModeUi();
+
+    const grid = document.querySelector('#pv-grid');
+    if (grid) grid.replaceChildren();
+    setStatus(mode === 'character' ? 'Загружаю чаров…' : 'Загружаю персоны…');
+    await loadCurrentMode();
+}
+
 function renderGrid() {
     const grid = document.querySelector('#pv-grid');
     if (!grid) return;
@@ -740,29 +1006,44 @@ function renderGrid() {
     if (!state.filtered.length) {
         const empty = document.createElement('div');
         empty.className = 'pv-empty';
-        empty.textContent = state.personas.length ? 'Ничего не найдено.' : 'Персоны не найдены.';
+        empty.textContent = currentItems().length ? 'Ничего не найдено.' : modeConfig().empty;
         grid.appendChild(empty);
         return;
     }
 
     const fragment = document.createDocumentFragment();
-    state.filtered.forEach(persona => fragment.appendChild(buildCard(persona)));
+    const builder = state.mode === 'character' ? buildCharacterCard : buildPersonaCard;
+    state.filtered.forEach(item => fragment.appendChild(builder(item)));
     grid.appendChild(fragment);
     updateSelectionUi();
 }
 
 function filterBy(query) {
     const value = lower(query);
-    state.filtered = value
-        ? state.personas.filter(persona => `${persona.name}\n${persona.description}\n${persona.loreName}`.toLocaleLowerCase('ru').includes(value))
-        : state.personas.slice();
+    const source = currentItems();
+
+    if (!value) {
+        state.filtered = source.slice();
+    } else if (state.mode === 'character') {
+        state.filtered = source.filter(character =>
+            `${character.name}\n${character.description}\n${character.creator}\n${character.tags.join(' ')}`
+                .toLocaleLowerCase('ru')
+                .includes(value));
+    } else {
+        state.filtered = source.filter(persona =>
+            `${persona.name}\n${persona.description}\n${persona.loreName}`
+                .toLocaleLowerCase('ru')
+                .includes(value));
+    }
+
     renderGrid();
 }
 
 function openVault() {
     document.querySelector('#pv-modal')?.classList.add('is-open');
     document.body.classList.add('pv-lock-scroll');
-    loadPersonas().catch(showError);
+    syncModeUi();
+    loadCurrentMode().catch(showError);
 }
 
 function closeVault() {
@@ -778,12 +1059,18 @@ function mountModal() {
     modal.className = 'pv-modal';
     modal.innerHTML = `
         <div class="pv-backdrop" data-pv-close></div>
-        <section class="pv-window" role="dialog" aria-modal="true" aria-label="Persona Vault">
+        <section class="pv-window" role="dialog" aria-modal="true" aria-label="Persona and Character Vault">
             <header class="pv-window-head">
-                <div>
+                <div class="pv-head-copy">
                     <div class="pv-kicker">✦ ARCANE ARCHIVE ✦</div>
-                    <h2>Persona Vault <small style="opacity:.55;font-size:.45em">v${VERSION}</small></h2>
-                    <p>PNG-карточки, TXT и массовый ZIP для ваших персон.</p>
+                    <div class="pv-vault-tabs" role="tablist" aria-label="Vault mode">
+                        <button type="button" class="pv-vault-tab is-active" data-pv-mode="persona" aria-pressed="true">Persona Vault</button>
+                        <span class="pv-vault-divider">◇</span>
+                        <button type="button" class="pv-vault-tab" data-pv-mode="character" aria-pressed="false">Character Vault</button>
+                        <small class="pv-version">v${VERSION}</small>
+                    </div>
+                    <h2 id="pv-active-title" class="pv-sr-title">Persona Vault</h2>
+                    <p id="pv-active-subtitle">PNG-карточки, TXT и массовый ZIP для ваших персон.</p>
                 </div>
                 <button type="button" class="pv-close" data-pv-close aria-label="Закрыть">×</button>
             </header>
@@ -792,8 +1079,8 @@ function mountModal() {
                 <input id="pv-search" class="pv-search" type="search" placeholder="Поиск по персонам…" autocomplete="off">
                 <button type="button" id="pv-select-all" class="pv-btn">Выбрать все</button>
                 <button type="button" id="pv-clear" class="pv-btn">Снять</button>
-                <button type="button" id="pv-download-selected-png" class="pv-btn pv-btn-primary" disabled>PNG</button>
-                <button type="button" id="pv-download-selected-txt" class="pv-btn" disabled>TXT</button>
+                <button type="button" id="pv-download-primary" class="pv-btn pv-btn-primary" disabled>PNG</button>
+                <button type="button" id="pv-download-secondary" class="pv-btn" disabled>TXT</button>
                 <span id="pv-selected-count" class="pv-count" hidden>0</span>
                 <button type="button" id="pv-refresh" class="pv-btn pv-icon-btn" title="Обновить">↻</button>
             </div>
@@ -806,14 +1093,24 @@ function mountModal() {
     document.body.appendChild(modal);
 
     modal.querySelectorAll('[data-pv-close]').forEach(node => node.addEventListener('click', closeVault));
+    modal.querySelectorAll('[data-pv-mode]').forEach(button => {
+        button.addEventListener('click', () => {
+            if (button.dataset.pvMode === state.mode) return;
+            setMode(button.dataset.pvMode).catch(showError);
+        });
+    });
     modal.querySelector('#pv-search').addEventListener('input', event => filterBy(event.target.value));
-    modal.querySelector('#pv-refresh').addEventListener('click', () => loadPersonas().catch(showError));
-    modal.querySelector('#pv-download-selected-png').addEventListener('click', () => exportSelection('png'));
-    modal.querySelector('#pv-download-selected-txt').addEventListener('click', () => exportSelection('txt'));
+    modal.querySelector('#pv-refresh').addEventListener('click', () => loadCurrentMode().catch(showError));
+    modal.querySelector('#pv-download-primary').addEventListener('click', () => exportSelection('png'));
+    modal.querySelector('#pv-download-secondary').addEventListener('click', () => exportSelection(modeConfig().secondType));
     modal.querySelector('#pv-select-all').addEventListener('click', () => {
-        state.filtered
-            .filter(persona => !persona.avatarMissing)
-            .forEach(persona => state.selected.add(persona.avatar));
+        if (state.mode === 'character') {
+            state.filtered.forEach(character => state.selected.add(character.key));
+        } else {
+            state.filtered
+                .filter(persona => !persona.avatarMissing)
+                .forEach(persona => state.selected.add(persona.avatar));
+        }
         updateSelectionUi();
     });
     modal.querySelector('#pv-clear').addEventListener('click', () => {
@@ -841,8 +1138,8 @@ function mountSettingsEntry() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <p class="pv-settings-copy">Резервные PNG/TXT для персон. При наличии привязанного Persona Lore расширка пытается встроить lorebook в PNG.</p>
-                <button type="button" id="pv-open" class="menu_button">Открыть хранилище персон</button>
+                <p class="pv-settings-copy">Persona Vault: PNG/TXT с Persona Lore. Character Vault: нативный PNG/JSON экспорт SillyTavern с Character Lore.</p>
+                <button type="button" id="pv-open" class="menu_button">Открыть Vault</button>
             </div>
         </div>
     `;

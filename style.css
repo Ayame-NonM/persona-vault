@@ -259,3 +259,70 @@
   .pv-image-wrap{height:180px;}
   .pv-window-head p{display:none;}
 }
+
+/* ───── Persona / Character mode switch ───── */
+.pv-head-copy{min-width:0;}
+.pv-vault-tabs{
+  display:flex;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:4px;
+}
+.pv-vault-tab{
+  appearance:none;
+  padding:0;
+  border:0;
+  background:none;
+  color:var(--pv-muted);
+  font-family:Georgia,"Times New Roman",serif;
+  font-size:1.55rem;
+  font-weight:600;
+  letter-spacing:.045em;
+  cursor:pointer;
+  transition:color .18s ease,text-shadow .18s ease,opacity .18s ease;
+  opacity:.52;
+}
+.pv-vault-tab:hover{color:var(--pv-soft);opacity:.82;}
+.pv-vault-tab.is-active{
+  color:var(--pv-text);
+  opacity:1;
+  text-shadow:0 0 18px rgba(183,116,255,.12);
+}
+.pv-vault-divider{
+  color:var(--pv-violet2);
+  opacity:.42;
+  font-size:.72rem;
+}
+.pv-version{
+  color:var(--pv-muted);
+  font-size:.70rem;
+  letter-spacing:.08em;
+  opacity:.72;
+}
+.pv-sr-title{
+  position:absolute!important;
+  width:1px!important;
+  height:1px!important;
+  padding:0!important;
+  margin:-1px!important;
+  overflow:hidden!important;
+  clip:rect(0,0,0,0)!important;
+  white-space:nowrap!important;
+  border:0!important;
+}
+.pv-badge-char{
+  background:rgba(52,38,115,.78);
+  border-color:rgba(151,133,255,.34);
+}
+
+@media(orientation:portrait) and (max-width:1100px){
+  .pv-vault-tabs{gap:6px;}
+  .pv-vault-tab{font-size:1.18rem;}
+  .pv-version{font-size:.62rem;}
+}
+
+@media(max-width:520px){
+  .pv-vault-tab{font-size:1.02rem;}
+  .pv-vault-divider{font-size:.62rem;}
+}
