@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 
 let personas = [];
 let filtered = [];
@@ -296,6 +296,20 @@ async function ensureZip() {
     });
 }
 
+function uniqueZipFileName(persona, usedNames) {
+    const base = safeFileName(persona.name);
+    let candidate = `${base}.persona.png`;
+    let index = 2;
+
+    while (usedNames.has(candidate.toLocaleLowerCase())) {
+        candidate = `${base} (${index}).persona.png`;
+        index += 1;
+    }
+
+    usedNames.add(candidate.toLocaleLowerCase());
+    return candidate;
+}
+
 async function exportSelectedZip() {
     const items = personas.filter(persona => selected.has(persona.avatar));
     if (!items.length) return setStatus('Сначала выбери хотя бы одну персону.');
@@ -303,12 +317,13 @@ async function exportSelectedZip() {
     try {
         if (!(await ensureZip())) throw new Error('JSZip не найден в SillyTavern');
         const zip = new JSZip();
+        const usedNames = new Set();
 
         for (let i = 0; i < items.length; i++) {
             const persona = items[i];
             setStatus(`PNG ${i + 1}/${items.length}: ${persona.name}`);
             const blob = await buildPersonaPng(persona);
-            zip.file(`${safeFileName(persona.name)}.persona.png`, blob);
+            zip.file(uniqueZipFileName(persona, usedNames), blob);
         }
 
         setStatus('Упаковываю ZIP…');
