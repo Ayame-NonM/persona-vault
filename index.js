@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 
 let personas = [];
 let filtered = [];
@@ -28,17 +28,9 @@ async function postJson(url, body = {}) {
 }
 
 async function getPowerUser() {
-    try {
-        const data = await postJson('/api/settings/get');
-        const settings = typeof data?.settings === 'string'
-            ? JSON.parse(data.settings)
-            : (data?.settings || data || {});
-        return settings?.power_user || settings?.powerUserSettings || {};
-    } catch (error) {
-        console.warn(`[${MODULE}] settings API fallback`, error);
-        const c = ctx();
-        return c.powerUserSettings || c.power_user || {};
-    }
+    // Personas are already available in the live SillyTavern context.
+    // Reading them directly is faster and avoids depending on the settings API shape.
+    return ctx().powerUserSettings || {};
 }
 
 function normalizePersona(avatar, name, rawDescription) {
@@ -509,7 +501,7 @@ function mountModal() {
 
 function mountSettingsEntry() {
     if (document.querySelector('#pv-settings')) return;
-    const host = document.querySelector('#extensions_settings2');
+    const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
     if (!host) return false;
 
     const root = document.createElement('div');
@@ -552,6 +544,33 @@ function mount() {
     observer.observe(document.body, { childList: true, subtree: true });
 }
 
-export function init() {
-    setTimeout(mount, 0);
+let bootStarted = false;
+
+function boot() {
+    if (bootStarted) return;
+    bootStarted = true;
+
+    const start = () => {
+        try {
+            mount();
+        } catch (error) {
+            console.error(`[${MODULE}] failed to mount`, error);
+            window.toastr?.error?.(error?.message || String(error), 'Persona Vault');
+        }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start, { once: true });
+    } else {
+        setTimeout(start, 0);
+    }
 }
+
+export function init() {
+    boot();
+}
+
+// Also self-start when the module is loaded. The manifest hook calls init() too,
+// but this fallback keeps the extension working on ST builds/forks where lifecycle
+// hooks behave differently.
+boot();
