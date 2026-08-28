@@ -1,5 +1,5 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 
 const state = {
     personas: [],
@@ -43,6 +43,19 @@ function firstNonNull(...values) {
         if (value !== undefined && value !== null && value !== '') return value;
     }
     return null;
+}
+
+function avatarUrl(filename) {
+    return `/User Avatars/${encodeURIComponent(filename).replaceAll('%2F', '/')}`;
+}
+
+function safeFileName(value) {
+    const cleaned = String(value || 'persona')
+        .replace(/[\\/:*?"<>|\x00-\x1F]/g, '_')
+        .replace(/^\.+/, '')
+        .replace(/[. ]+$/, '')
+        .trim();
+    return (cleaned || 'persona').slice(0, 110);
 }
 
 function splitKeys(value) {
