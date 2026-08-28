@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Ayame-NonM",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "homePage": "https://github.com/Ayame-NonM/persona-vault",
   "auto_update": false,
   "hooks": {

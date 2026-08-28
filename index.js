@@ -1,74 +1,41 @@
 const MODULE = 'persona_vault';
-const VERSION = '0.1.3';
+const VERSION = '0.2.0';
 
-let personas = [];
-let filtered = [];
-let selected = new Set();
-let mounted = false;
+const state = {
+    personas: [],
+    filtered: [],
+    selected: new Set(),
+    mounted: false,
+    zipPromise: null,
+};
 
 function ctx() {
     return SillyTavern.getContext();
 }
 
-function requestHeaders() {
-    if (typeof window.getRequestHeaders === 'function') return window.getRequestHeaders();
-    const c = ctx();
-    if (typeof c.getRequestHeaders === 'function') return c.getRequestHeaders();
-    return { 'Content-Type': 'application/json' };
-}
-
-async function postJson(url, body = {}) {
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: requestHeaders(),
-        body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-    return response.json();
-}
-
-async function getPowerUser() {
-    // Personas are already available in the live SillyTavern context.
-    // Reading them directly is faster and avoids depending on the settings API shape.
+function powerUser() {
     return ctx().powerUserSettings || {};
 }
 
-function normalizePersona(avatar, name, rawDescription) {
-    const meta = rawDescription && typeof rawDescription === 'object'
-        ? rawDescription
-        : {};
-    const description = typeof rawDescription === 'string'
-        ? rawDescription
-        : String(meta.description || '');
-
-    return {
-        avatar,
-        name: String(name || 'Без имени'),
-        description,
-        title: String(meta.title || ''),
-        position: meta.position ?? null,
-        depth: meta.depth ?? null,
-        role: meta.role ?? null,
-    };
+function lower(value) {
+    return String(value ?? '').trim().toLocaleLowerCase('ru');
 }
 
-async function loadPersonas() {
-    const powerUser = await getPowerUser();
-    const names = powerUser?.personas && typeof powerUser.personas === 'object'
-        ? powerUser.personas
-        : {};
-    const descriptions = powerUser?.persona_descriptions && typeof powerUser.persona_descriptions === 'object'
-        ? powerUser.persona_descriptions
-        : {};
+function firstNonNull(...values) {
+    for (const value of values) {
+        if (value !== undefined && value !== null && value !== '') return value;
+    }
+    return null;
+}
 
-    personas = Object.entries(names)
-        .map(([avatar, name]) => normalizePersona(avatar, name, descriptions[avatar]))
-        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
-
-    filtered = personas.slice();
-    selected.clear();
-    renderGrid();
-    setStatus(`Найдено персон: ${personas.length}`);
+function uniqueObjects(items) {
+    const seen = new Set();
+    return items.filter(item => {
+        if (!item || typeof item !== 'object') return false;
+        if (seen.has(item)) return false;
+        seen.add(item);
+        return true;
+    });
 }
 
 function avatarUrl(filename) {
@@ -81,7 +48,259 @@ function safeFileName(value) {
         .replace(/^\.+/, '')
         .replace(/[. ]+$/, '')
         .trim();
-    return (cleaned || 'persona').slice(0, 100);
+    return (cleaned || 'persona').slice(0, 110);
+}
+
+function splitKeys(value) {
+    if (Array.isArray(value)) return value.map(item => String(item).trim()).filter(Boolean);
+    return String(value || '')
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean);
+}
+
+function normalizeLoreRef(ref) {
+    if (!ref) return null;
+    if (typeof ref === 'string') return { name: ref };
+    if (typeof ref === 'number') return { id: ref };
+    if (typeof ref !== 'object') return null;
+
+    return {
+        name: firstNonNull(ref.name, ref.title, ref.world, ref.world_info, ref.filename, ref.file),
+        id: firstNonNull(ref.id, ref.uid, ref.world_id, ref.world_info_uid),
+        data: ref.entries || ref.data?.entries ? (ref.data || ref) : null,
+    };
+}
+
+function resolvePersonaLoreBinding(avatar, rawMeta, settings) {
+    const direct = firstNonNull(
+        rawMeta?.persona_lore,
+        rawMeta?.personaLore,
+        rawMeta?.lorebook,
+        rawMeta?.lore_book,
+        rawMeta?.world_info,
+        rawMeta?.worldInfo,
+        settings?.persona_lore?.[avatar],
+        settings?.personaLore?.[avatar],
+        settings?.persona_lorebook?.[avatar],
+        settings?.persona_lorebooks?.[avatar],
+        settings?.persona_world_info?.[avatar],
+        settings?.personaWorldInfo?.[avatar],
+        settings?.persona_world?.[avatar],
+        settings?.personaWorld?.[avatar],
+        settings?.persona_metadata?.[avatar]?.persona_lore,
+        settings?.persona_metadata?.[avatar]?.lorebook,
+        settings?.persona_metadata?.[avatar]?.world_info,
+        settings?.personaMetadata?.[avatar]?.persona_lore,
+        settings?.personaMetadata?.[avatar]?.lorebook,
+        settings?.personaMetadata?.[avatar]?.world_info,
+    );
+
+    return normalizeLoreRef(direct);
+}
+
+function looksLikeLorebook(value) {
+    return Boolean(
+        value && typeof value === 'object' &&
+        (Array.isArray(value.entries) || (value.entries && typeof value.entries === 'object'))
+    );
+}
+
+function lorebookNameOf(value) {
+    return firstNonNull(value?.name, value?.title, value?.world_name, value?.worldName, value?.filename, value?.file);
+}
+
+function lorebookIdOf(value) {
+    return firstNonNull(value?.id, value?.uid, value?.world_id, value?.worldInfoUid, value?.world_info_uid);
+}
+
+function gatherLoreStores(settings) {
+    const c = ctx();
+    return uniqueObjects([
+        c.worldInfo,
+        c.world_info,
+        c.worldInfoCache,
+        c.world_info_cache,
+        c.worldNames,
+        c.world_names,
+        c.lorebooks,
+        c.worlds,
+        c.data?.worldInfo,
+        c.data?.world_info,
+        settings.worldInfo,
+        settings.world_info,
+        settings.worldInfoCache,
+        settings.world_info_cache,
+        settings.worlds,
+        settings.world_names,
+        settings.worldNames,
+        window.worldInfo,
+        window.world_info,
+        window.worldInfoCache,
+        window.world_names,
+    ]);
+}
+
+function directLorebookLookup(store, binding) {
+    if (!store || !binding) return null;
+
+    const wantedName = lower(binding.name);
+    const wantedId = String(binding.id ?? '').trim();
+
+    const probe = candidate => {
+        if (!candidate || typeof candidate !== 'object') return null;
+        if (!looksLikeLorebook(candidate)) return null;
+
+        const candidateName = lower(lorebookNameOf(candidate));
+        const candidateId = String(lorebookIdOf(candidate) ?? '').trim();
+
+        if (wantedName && candidateName && candidateName === wantedName) return candidate;
+        if (wantedId && candidateId && candidateId === wantedId) return candidate;
+        return null;
+    };
+
+    if (Array.isArray(store)) {
+        for (const item of store) {
+            const found = probe(item);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    if (typeof store === 'object') {
+        if (wantedName && store[wantedName]) {
+            const found = probe(store[wantedName]);
+            if (found) return found;
+        }
+        if (binding.name && store[binding.name]) {
+            const found = probe(store[binding.name]);
+            if (found) return found;
+        }
+        if (wantedId && store[wantedId]) {
+            const found = probe(store[wantedId]);
+            if (found) return found;
+        }
+
+        if (looksLikeLorebook(store)) {
+            const found = probe(store);
+            if (found) return found;
+        }
+
+        for (const value of Object.values(store)) {
+            const found = probe(value);
+            if (found) return found;
+        }
+    }
+
+    return null;
+}
+
+function normalizeCharacterBook(source, fallbackName = '') {
+    if (!looksLikeLorebook(source)) return null;
+
+    const rawEntries = Array.isArray(source.entries)
+        ? source.entries
+        : Object.values(source.entries || {});
+
+    const entries = rawEntries
+        .map((entry, index) => {
+            if (!entry || typeof entry !== 'object') return null;
+
+            const content = String(firstNonNull(entry.content, entry.text, entry.entry, entry.value, entry.memo, '')).trim();
+            const keys = splitKeys(firstNonNull(entry.keys, entry.key, entry.primary_keys));
+            const secondary = splitKeys(firstNonNull(entry.secondary_keys, entry.keysecondary, entry.secondary));
+            const enabled = entry.enabled ?? !entry.disable;
+
+            if (!content) return null;
+
+            return {
+                keys,
+                content,
+                extensions: typeof entry.extensions === 'object' && entry.extensions ? entry.extensions : {},
+                enabled: Boolean(enabled),
+                insertion_order: Number(firstNonNull(entry.insertion_order, entry.order, entry.display_index, index)) || 0,
+                case_sensitive: Boolean(firstNonNull(entry.case_sensitive, entry.caseSensitive, false)),
+                id: firstNonNull(entry.id, entry.uid, index),
+                name: firstNonNull(entry.name, entry.comment, entry.title) || undefined,
+                comment: firstNonNull(entry.comment, entry.memo) || undefined,
+                selective: Boolean(firstNonNull(entry.selective, entry.selectiveLogic, false)),
+                secondary_keys: secondary.length ? secondary : undefined,
+                constant: Boolean(firstNonNull(entry.constant, entry.always_active, false)),
+                position: firstNonNull(entry.position, entry.insertion_position, entry.place) || undefined,
+                priority: firstNonNull(entry.priority, entry.weight) ?? undefined,
+            };
+        })
+        .filter(Boolean);
+
+    if (!entries.length) return null;
+
+    return {
+        name: String(firstNonNull(lorebookNameOf(source), fallbackName, 'Persona Lore')).trim() || 'Persona Lore',
+        description: String(firstNonNull(source.description, source.comment, '')).trim(),
+        scan_depth: Number(firstNonNull(source.scan_depth, source.scanDepth, source.depth, 4)) || 4,
+        token_budget: Number(firstNonNull(source.token_budget, source.tokenBudget, source.context_limit, 512)) || 512,
+        recursive_scanning: Boolean(firstNonNull(source.recursive_scanning, source.recursiveScanning, true)),
+        extensions: typeof source.extensions === 'object' && source.extensions ? source.extensions : {},
+        entries,
+    };
+}
+
+function resolveCharacterBook(persona, settings) {
+    const binding = persona.loreBinding;
+    if (!binding) return null;
+
+    if (binding.data) {
+        return normalizeCharacterBook(binding.data, binding.name);
+    }
+
+    for (const store of gatherLoreStores(settings)) {
+        const found = directLorebookLookup(store, binding);
+        if (found) return normalizeCharacterBook(found, binding.name);
+    }
+
+    return null;
+}
+
+function normalizePersona(avatar, name, rawDescription, settings) {
+    const meta = rawDescription && typeof rawDescription === 'object' ? rawDescription : {};
+    const description = typeof rawDescription === 'string'
+        ? rawDescription
+        : String(meta.description || '');
+
+    const persona = {
+        avatar,
+        name: String(name || 'Без имени'),
+        description,
+        title: String(meta.title || ''),
+        position: meta.position ?? null,
+        depth: meta.depth ?? null,
+        role: meta.role ?? null,
+        loreBinding: resolvePersonaLoreBinding(avatar, meta, settings),
+    };
+
+    persona.characterBook = resolveCharacterBook(persona, settings);
+    persona.hasLore = Boolean(persona.characterBook);
+    persona.loreName = persona.characterBook?.name || persona.loreBinding?.name || '';
+    return persona;
+}
+
+async function loadPersonas() {
+    const settings = powerUser();
+    const names = settings?.personas && typeof settings.personas === 'object' ? settings.personas : {};
+    const descriptions = settings?.persona_descriptions && typeof settings.persona_descriptions === 'object'
+        ? settings.persona_descriptions
+        : {};
+
+    state.personas = Object.entries(names)
+        .map(([avatar, name]) => normalizePersona(avatar, name, descriptions[avatar], settings))
+        .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+
+    state.filtered = state.personas.slice();
+    state.selected.clear();
+    renderGrid();
+
+    const loreCount = state.personas.filter(persona => persona.hasLore).length;
+    setStatus(`Готово: ${state.personas.length} персон${loreCount ? ` · с lorebook: ${loreCount}` : ''}.`);
 }
 
 function downloadBlob(blob, filename) {
@@ -116,13 +335,14 @@ function cardPayload(persona) {
             scenario: '',
             first_mes: '',
             mes_example: '',
-            creator_notes: 'SillyTavern Persona backup. Import this PNG as a Character, then use Convert to Persona. The Description is the original persona text; keep its macros unchanged when restoring.',
+            creator_notes: 'SillyTavern Persona backup generated by Persona Vault. Import the PNG as a Character, then use Convert to Persona. If a lorebook was embedded, SillyTavern can import it as Character Lore during character import.',
             system_prompt: '',
             post_history_instructions: '',
             alternate_greetings: [],
-            tags: ['persona-backup'],
+            character_book: persona.characterBook || undefined,
+            tags: ['persona-backup', 'persona-vault'],
             creator: 'Persona Vault',
-            character_version: '1.0',
+            character_version: VERSION,
             extensions: {
                 persona_vault: {
                     backup: true,
@@ -132,8 +352,9 @@ function cardPayload(persona) {
                     position: persona.position,
                     depth: persona.depth,
                     role: persona.role,
+                    lorebook_name: persona.loreName || null,
+                    has_embedded_lorebook: Boolean(persona.characterBook),
                     exported_at: new Date().toISOString(),
-                    extension_version: VERSION,
                 },
             },
         },
@@ -155,13 +376,14 @@ async function toPngBytes(blob) {
     const canvas = document.createElement('canvas');
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
-    const context = canvas.getContext('2d');
-    context.drawImage(bitmap, 0, 0);
+    const context2d = canvas.getContext('2d');
+    context2d.drawImage(bitmap, 0, 0);
     bitmap.close?.();
 
     const pngBlob = await new Promise((resolve, reject) => {
         canvas.toBlob(result => result ? resolve(result) : reject(new Error('Не удалось конвертировать аватар в PNG')), 'image/png');
     });
+
     return new Uint8Array(await pngBlob.arrayBuffer());
 }
 
@@ -266,46 +488,63 @@ async function buildPersonaPng(persona) {
     return new Blob([output], { type: 'image/png' });
 }
 
+function buildPersonaTxt(persona) {
+    const header = [
+        `Name: ${persona.name}`,
+        persona.title ? `Title: ${persona.title}` : '',
+        persona.loreName ? `Persona Lorebook: ${persona.loreName}` : '',
+        '',
+        persona.description || '',
+    ].filter(Boolean).join('\n');
+
+    return new Blob([header], { type: 'text/plain;charset=utf-8' });
+}
+
 async function exportPng(persona) {
     try {
         setStatus(`Собираю PNG: ${persona.name}…`);
         const blob = await buildPersonaPng(persona);
         downloadBlob(blob, `${safeFileName(persona.name)}.persona.png`);
-        setStatus(`PNG готов: ${persona.name}`);
+        setStatus(`PNG готов: ${persona.name}${persona.hasLore ? ' · lorebook встроен' : ''}.`);
     } catch (error) {
         showError(error);
     }
 }
 
 function exportTxt(persona) {
-    const blob = new Blob([persona.description], { type: 'text/plain;charset=utf-8' });
-    downloadBlob(blob, `${safeFileName(persona.name)}.persona.txt`);
-    setStatus(`TXT готов: ${persona.name}`);
+    try {
+        const blob = buildPersonaTxt(persona);
+        downloadBlob(blob, `${safeFileName(persona.name)}.persona.txt`);
+        setStatus(`TXT готов: ${persona.name}.`);
+    } catch (error) {
+        showError(error);
+    }
 }
 
-let zipReady = false;
 async function ensureZip() {
     if (window.JSZip) return true;
-    if (zipReady) return Boolean(window.JSZip);
-    zipReady = true;
-    return new Promise(resolve => {
+    if (state.zipPromise) return state.zipPromise;
+
+    state.zipPromise = new Promise(resolve => {
         const script = document.createElement('script');
         script.src = '/lib/jszip.min.js';
         script.onload = () => resolve(Boolean(window.JSZip));
         script.onerror = () => resolve(false);
         document.head.appendChild(script);
     });
+
+    return state.zipPromise;
 }
 
-function uniqueZipFileName(persona, usedNames) {
+function uniqueZipFileName(persona, usedNames, ext) {
     const base = safeFileName(persona.name);
     const avatarStem = safeFileName(String(persona.avatar || 'avatar').replace(/\.[^.]+$/, ''));
-    const uniqueId = avatarStem.slice(-18) || 'avatar';
-    let candidate = `${base} [${uniqueId}].persona.png`;
+    const suffix = avatarStem.slice(-18) || 'avatar';
+    let candidate = `${base} [${suffix}].persona.${ext}`;
     let index = 2;
 
     while (usedNames.has(candidate.toLocaleLowerCase())) {
-        candidate = `${base} [${uniqueId}-${index}].persona.png`;
+        candidate = `${base} [${suffix}-${index}].persona.${ext}`;
         index += 1;
     }
 
@@ -313,8 +552,8 @@ function uniqueZipFileName(persona, usedNames) {
     return candidate;
 }
 
-async function exportSelectedZip() {
-    const items = personas.filter(persona => selected.has(persona.avatar));
+async function exportSelected(type) {
+    const items = state.personas.filter(persona => state.selected.has(persona.avatar));
     if (!items.length) return setStatus('Сначала выбери хотя бы одну персону.');
 
     try {
@@ -324,22 +563,21 @@ async function exportSelectedZip() {
 
         for (let i = 0; i < items.length; i++) {
             const persona = items[i];
-            setStatus(`PNG ${i + 1}/${items.length}: ${persona.name}`);
-            const blob = await buildPersonaPng(persona);
-            const filename = uniqueZipFileName(persona, usedNames);
-            zip.file(filename, await blob.arrayBuffer());
+            setStatus(`${type.toUpperCase()} ${i + 1}/${items.length}: ${persona.name}`);
+
+            if (type === 'png') {
+                const blob = await buildPersonaPng(persona);
+                zip.file(uniqueZipFileName(persona, usedNames, 'png'), await blob.arrayBuffer());
+            } else {
+                const blob = buildPersonaTxt(persona);
+                zip.file(uniqueZipFileName(persona, usedNames, 'txt'), await blob.arrayBuffer());
+            }
         }
 
-        const entryCount = Object.values(zip.files).filter(entry => !entry.dir).length;
-        if (entryCount !== items.length) {
-            throw new Error(`ZIP содержит ${entryCount} из ${items.length} подготовленных файлов`);
-        }
-
-        setStatus(`Упаковываю ZIP · ${entryCount}/${items.length}…`);
         const archive = await zip.generateAsync({ type: 'blob' });
         const stamp = new Date().toISOString().slice(0, 10);
-        downloadBlob(archive, `persona-vault-${stamp}.zip`);
-        setStatus(`Готово: ${items.length} PNG в ZIP.`);
+        downloadBlob(archive, `persona-vault-${type}-${stamp}.zip`);
+        setStatus(`Готово: ${items.length} ${type.toUpperCase()} в ZIP.`);
     } catch (error) {
         showError(error);
     }
@@ -359,19 +597,21 @@ function setStatus(text, isError = false) {
 }
 
 function updateSelectionUi() {
-    document.querySelector('#pv-selected-count')?.replaceChildren(document.createTextNode(String(selected.size)));
+    document.querySelector('#pv-selected-count')?.replaceChildren(document.createTextNode(String(state.selected.size)));
     document.querySelectorAll('.pv-card').forEach(card => {
-        card.classList.toggle('is-selected', selected.has(card.dataset.avatar));
+        const selected = state.selected.has(card.dataset.avatar);
+        card.classList.toggle('is-selected', selected);
         const input = card.querySelector('.pv-check');
-        if (input) input.checked = selected.has(card.dataset.avatar);
+        if (input) input.checked = selected;
     });
 }
 
-function makeButton(label, className, onClick) {
+function makeButton(label, className, onClick, title = '') {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = className;
     button.textContent = label;
+    if (title) button.title = title;
     button.addEventListener('click', event => {
         event.stopPropagation();
         onClick();
@@ -400,10 +640,18 @@ function buildCard(persona) {
     check.setAttribute('aria-label', `Выбрать ${persona.name}`);
     check.addEventListener('click', event => event.stopPropagation());
     check.addEventListener('change', () => {
-        check.checked ? selected.add(persona.avatar) : selected.delete(persona.avatar);
+        check.checked ? state.selected.add(persona.avatar) : state.selected.delete(persona.avatar);
         updateSelectionUi();
     });
     imageWrap.appendChild(check);
+
+    if (persona.hasLore || persona.loreName) {
+        const badge = document.createElement('span');
+        badge.className = 'pv-badge';
+        badge.textContent = 'LORE';
+        badge.title = persona.loreName ? `Привязан lorebook: ${persona.loreName}` : 'У персоны найден lorebook';
+        imageWrap.appendChild(badge);
+    }
 
     const body = document.createElement('div');
     body.className = 'pv-card-body';
@@ -412,6 +660,12 @@ function buildCard(persona) {
     name.className = 'pv-name';
     name.textContent = persona.name;
 
+    const meta = document.createElement('div');
+    meta.className = 'pv-meta';
+    meta.textContent = persona.loreName
+        ? `Lorebook: ${persona.loreName}`
+        : (persona.title || 'Без привязанного lorebook');
+
     const preview = document.createElement('p');
     preview.className = 'pv-description';
     preview.textContent = persona.description || 'Описание пустое';
@@ -419,15 +673,15 @@ function buildCard(persona) {
     const actions = document.createElement('div');
     actions.className = 'pv-card-actions';
     actions.append(
-        makeButton('PNG', 'pv-btn pv-btn-primary', () => exportPng(persona)),
-        makeButton('TXT', 'pv-btn', () => exportTxt(persona)),
+        makeButton('PNG', 'pv-btn pv-btn-primary', () => exportPng(persona), 'Скачать PNG-карточку'),
+        makeButton('TXT', 'pv-btn', () => exportTxt(persona), 'Скачать TXT-описание'),
     );
 
-    body.append(name, preview, actions);
+    body.append(name, meta, preview, actions);
     card.append(imageWrap, body);
 
     card.addEventListener('click', () => {
-        selected.has(persona.avatar) ? selected.delete(persona.avatar) : selected.add(persona.avatar);
+        state.selected.has(persona.avatar) ? state.selected.delete(persona.avatar) : state.selected.add(persona.avatar);
         updateSelectionUi();
     });
 
@@ -439,25 +693,25 @@ function renderGrid() {
     if (!grid) return;
     grid.replaceChildren();
 
-    if (!filtered.length) {
+    if (!state.filtered.length) {
         const empty = document.createElement('div');
         empty.className = 'pv-empty';
-        empty.textContent = personas.length ? 'Ничего не найдено.' : 'Персоны не найдены.';
+        empty.textContent = state.personas.length ? 'Ничего не найдено.' : 'Персоны не найдены.';
         grid.appendChild(empty);
         return;
     }
 
     const fragment = document.createDocumentFragment();
-    filtered.forEach(persona => fragment.appendChild(buildCard(persona)));
+    state.filtered.forEach(persona => fragment.appendChild(buildCard(persona)));
     grid.appendChild(fragment);
     updateSelectionUi();
 }
 
 function filterBy(query) {
-    const value = String(query || '').trim().toLocaleLowerCase('ru');
-    filtered = value
-        ? personas.filter(p => `${p.name}\n${p.description}`.toLocaleLowerCase('ru').includes(value))
-        : personas.slice();
+    const value = lower(query);
+    state.filtered = value
+        ? state.personas.filter(persona => `${persona.name}\n${persona.description}\n${persona.loreName}`.toLocaleLowerCase('ru').includes(value))
+        : state.personas.slice();
     renderGrid();
 }
 
@@ -485,7 +739,7 @@ function mountModal() {
                 <div>
                     <div class="pv-kicker">✦ ARCANE ARCHIVE ✦</div>
                     <h2>Persona Vault <small style="opacity:.55;font-size:.45em">v${VERSION}</small></h2>
-                    <p>Персоны → переносимые PNG-карточки или чистый TXT.</p>
+                    <p>PNG-карточки, TXT и массовый ZIP для ваших персон.</p>
                 </div>
                 <button type="button" class="pv-close" data-pv-close aria-label="Закрыть">×</button>
             </header>
@@ -494,7 +748,8 @@ function mountModal() {
                 <input id="pv-search" class="pv-search" type="search" placeholder="Поиск по персонам…" autocomplete="off">
                 <button type="button" id="pv-select-all" class="pv-btn">Выбрать все</button>
                 <button type="button" id="pv-clear" class="pv-btn">Снять</button>
-                <button type="button" id="pv-download-selected" class="pv-btn pv-btn-primary">PNG ZIP · <span id="pv-selected-count">0</span></button>
+                <button type="button" id="pv-download-selected-png" class="pv-btn pv-btn-primary">PNG ZIP · <span id="pv-selected-count">0</span></button>
+                <button type="button" id="pv-download-selected-txt" class="pv-btn">TXT ZIP</button>
                 <button type="button" id="pv-refresh" class="pv-btn pv-icon-btn" title="Обновить">↻</button>
             </div>
 
@@ -508,13 +763,14 @@ function mountModal() {
     modal.querySelectorAll('[data-pv-close]').forEach(node => node.addEventListener('click', closeVault));
     modal.querySelector('#pv-search').addEventListener('input', event => filterBy(event.target.value));
     modal.querySelector('#pv-refresh').addEventListener('click', () => loadPersonas().catch(showError));
-    modal.querySelector('#pv-download-selected').addEventListener('click', exportSelectedZip);
+    modal.querySelector('#pv-download-selected-png').addEventListener('click', () => exportSelected('png'));
+    modal.querySelector('#pv-download-selected-txt').addEventListener('click', () => exportSelected('txt'));
     modal.querySelector('#pv-select-all').addEventListener('click', () => {
-        filtered.forEach(persona => selected.add(persona.avatar));
+        state.filtered.forEach(persona => state.selected.add(persona.avatar));
         updateSelectionUi();
     });
     modal.querySelector('#pv-clear').addEventListener('click', () => {
-        selected.clear();
+        state.selected.clear();
         updateSelectionUi();
     });
 
@@ -524,7 +780,7 @@ function mountModal() {
 }
 
 function mountSettingsEntry() {
-    if (document.querySelector('#pv-settings')) return;
+    if (document.querySelector('#pv-settings')) return true;
     const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
     if (!host) return false;
 
@@ -538,22 +794,23 @@ function mountSettingsEntry() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <p class="pv-settings-copy">Резервные PNG-карточки и TXT для ваших персон.</p>
+                <p class="pv-settings-copy">Резервные PNG/TXT для персон. При наличии привязанного Persona Lore расширка пытается встроить lorebook в PNG.</p>
                 <button type="button" id="pv-open" class="menu_button">Открыть хранилище персон</button>
             </div>
         </div>
     `;
+
     host.appendChild(root);
     root.querySelector('#pv-open').addEventListener('click', openVault);
     return true;
 }
 
 function mount() {
-    if (mounted) return;
+    if (state.mounted) return;
     mountModal();
 
     if (mountSettingsEntry()) {
-        mounted = true;
+        state.mounted = true;
         console.log(`[${MODULE}] v${VERSION} loaded`);
         return;
     }
@@ -561,10 +818,11 @@ function mount() {
     const observer = new MutationObserver(() => {
         if (mountSettingsEntry()) {
             observer.disconnect();
-            mounted = true;
+            state.mounted = true;
             console.log(`[${MODULE}] v${VERSION} loaded`);
         }
     });
+
     observer.observe(document.body, { childList: true, subtree: true });
 }
 
@@ -594,7 +852,4 @@ export function init() {
     boot();
 }
 
-// Also self-start when the module is loaded. The manifest hook calls init() too,
-// but this fallback keeps the extension working on ST builds/forks where lifecycle
-// hooks behave differently.
 boot();
